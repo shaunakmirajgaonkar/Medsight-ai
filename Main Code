@@ -1,0 +1,1793 @@
+"""
+MedInsight AI v4 — 100% Local Clinical Decision Support
+=========================================================
+NEW in v4:
+  • Completely redesigned UI — clean white/green medical theme
+  • PDF report export via ReportLab (professional clinical report)
+  • Document upload gate (PDF/DOCX/TXT/Image → auto-extract)
+  • Advanced analysis with confidence scoring & evidence grades
+  • All inference via Ollama — zero API keys, zero cloud
+
+Run:
+    pip install streamlit requests pymupdf python-docx reportlab Pillow pytesseract
+    brew install tesseract          (optional, for image OCR)
+    ollama pull llama3.1:8b
+    ollama serve
+    streamlit run Medsight_ai.py
+"""
+
+import io, json, re, time, requests, streamlit as st
+from datetime import datetime
+from pathlib import Path
+
+# ── optional libs ──────────────────────────────────────────────────────────────
+try:
+    import fitz;           HAS_PDF  = True
+except ImportError:        HAS_PDF  = False
+try:
+    from docx import Document as DocxDoc; HAS_DOCX = True
+except ImportError:                        HAS_DOCX = False
+try:
+    from PIL import Image; import pytesseract; HAS_OCR = True
+except ImportError:                            HAS_OCR = False
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                     Table, TableStyle, HRFlowable, KeepTogether)
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    HAS_RL = True
+except ImportError:
+    HAS_RL = False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="MedInsight AI | Clinical Decision Support",
+    page_icon="🩺",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CSS — clean white + emerald green medical theme
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Merriweather:wght@400;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ── Root ── */
+:root {
+    --bg:       #F7F9FC;
+    --white:    #FFFFFF;
+    --surface:  #EEF2F7;
+    --border:   #D1D9E6;
+    --green:    #059669;
+    --green2:   #065F46;
+    --green-lt: #D1FAE5;
+    --blue:     #2563EB;
+    --blue-lt:  #DBEAFE;
+    --red:      #DC2626;
+    --red-lt:   #FEE2E2;
+    --orange:   #D97706;
+    --orange-lt:#FEF3C7;
+    --gray:     #374151;
+    --gray2:    #6B7280;
+    --gray3:    #9CA3AF;
+    --text:     #111827;
+}
+
+/* ── Global ── */
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif !important;
+    background: var(--bg) !important;
+    color: var(--text) !important;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: var(--white) !important;
+    border-right: 1.5px solid var(--border) !important;
+    box-shadow: 2px 0 8px rgba(0,0,0,.04) !important;
+}
+[data-testid="stSidebar"] * { color: var(--gray) !important; }
+[data-testid="stSidebar"] h3 { color: var(--green) !important; font-size:.78rem !important; text-transform:uppercase; letter-spacing:.08em; }
+
+/* ── Main background ── */
+.stApp { background: var(--bg) !important; }
+.block-container { padding: 2rem 2.5rem !important; max-width: 1300px !important; }
+
+/* ── Headings ── */
+h1 { font-family:'Merriweather',serif !important; font-size:1.9rem !important; color:var(--text) !important; font-weight:700 !important; }
+h2 { font-size:1.1rem !important; font-weight:700 !important; color:var(--green2) !important; text-transform:uppercase; letter-spacing:.06em; }
+h3 { font-size:.95rem !important; font-weight:600 !important; color:var(--gray) !important; }
+
+/* ── Cards ── */
+.card {
+    background: var(--white);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    padding: 1.4rem 1.6rem;
+    margin-bottom: 1rem;
+    box-shadow: 0 1px 4px rgba(0,0,0,.05);
+}
+.card-green  { border-left: 4px solid var(--green);  }
+.card-blue   { border-left: 4px solid var(--blue);   }
+.card-red    { border-left: 4px solid var(--red);    background: #FFFAFA; }
+.card-orange { border-left: 4px solid var(--orange); background: #FFFDF7; }
+
+/* ── Stat tiles ── */
+.tile {
+    background: var(--white);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    padding: 1.1rem 1.2rem;
+    text-align: center;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
+}
+.tile-val { font-size:1.6rem; font-weight:800; color:var(--green); font-family:'Inter',sans-serif; }
+.tile-lbl { font-size:.68rem; color:var(--gray2); text-transform:uppercase; letter-spacing:.08em; margin-top:3px; }
+
+/* ── Badges ── */
+.badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: .71rem;
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    margin-right: 4px;
+}
+.b-green  { background:var(--green-lt);  color:var(--green2); border:1px solid #6EE7B7; }
+.b-blue   { background:var(--blue-lt);   color:#1D4ED8;       border:1px solid #93C5FD; }
+.b-red    { background:var(--red-lt);    color:var(--red);    border:1px solid #FCA5A5; }
+.b-orange { background:var(--orange-lt); color:#92400E;       border:1px solid #FCD34D; }
+.b-gray   { background:var(--surface);   color:var(--gray2);  border:1px solid var(--border); }
+
+/* ── Risk bar ── */
+.rbar-bg   { background:var(--surface); border-radius:8px; height:10px; overflow:hidden; margin:6px 0 10px; }
+.rbar-fill { height:100%; border-radius:8px; }
+
+/* ── Confidence bar ── */
+.cbar-bg   { background:var(--surface); border-radius:4px; height:5px; overflow:hidden; margin:3px 0 7px; }
+.cbar-fill { height:100%; border-radius:4px; }
+
+/* ── Inputs ── */
+.stTextArea textarea, .stTextInput input {
+    background: var(--white) !important;
+    border: 1.5px solid var(--border) !important;
+    color: var(--text) !important;
+    border-radius: 8px !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: .88rem !important;
+    box-shadow: 0 1px 2px rgba(0,0,0,.04) !important;
+}
+.stTextArea textarea:focus, .stTextInput input:focus {
+    border-color: var(--green) !important;
+    box-shadow: 0 0 0 3px rgba(5,150,105,.1) !important;
+    outline: none !important;
+}
+label { color: var(--gray) !important; font-size:.82rem !important; font-weight:600 !important; }
+
+/* ── Buttons ── */
+.stButton > button {
+    background: var(--green) !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-weight: 700 !important;
+    font-size: .88rem !important;
+    padding: .55rem 1.4rem !important;
+    letter-spacing: .02em !important;
+    box-shadow: 0 2px 8px rgba(5,150,105,.25) !important;
+    transition: all .18s !important;
+}
+.stButton > button:hover {
+    background: var(--green2) !important;
+    box-shadow: 0 4px 16px rgba(5,150,105,.35) !important;
+    transform: translateY(-1px) !important;
+}
+
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] {
+    background: var(--white) !important;
+    border-radius: 10px !important;
+    border: 1.5px solid var(--border) !important;
+    gap: 2px; padding: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.05) !important;
+}
+.stTabs [data-baseweb="tab"] {
+    background: transparent !important;
+    color: var(--gray2) !important;
+    border-radius: 8px !important;
+    font-weight: 500 !important;
+    font-size: .84rem !important;
+}
+.stTabs [aria-selected="true"] {
+    background: var(--green) !important;
+    color: #fff !important;
+    font-weight: 700 !important;
+}
+
+/* ── File uploader ── */
+[data-testid="stFileUploader"] {
+    background: var(--white) !important;
+    border: 2px dashed var(--border) !important;
+    border-radius: 12px !important;
+}
+[data-testid="stFileUploader"]:hover { border-color: var(--green) !important; }
+
+/* ── Expander ── */
+[data-testid="stExpander"] {
+    border: 1.5px solid var(--border) !important;
+    border-radius: 10px !important;
+    background: var(--white) !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04) !important;
+}
+
+/* ── Select ── */
+.stSelectbox [data-baseweb="select"] > div {
+    background: var(--white) !important;
+    border-color: var(--border) !important;
+    border-radius: 8px !important;
+}
+
+/* ── Alerts ── */
+.stAlert { border-radius:10px !important; }
+
+/* ── HR ── */
+hr { border-color: var(--border) !important; margin:1rem 0 !important; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width:5px; }
+::-webkit-scrollbar-track { background:var(--bg); }
+::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+/* ── Banners ── */
+.banner-warn {
+    background: var(--orange-lt);
+    border: 1.5px solid #FCD34D;
+    border-radius: 10px;
+    padding: .7rem 1.1rem;
+    font-size: .82rem;
+    color: #92400E;
+    margin-bottom: 1.1rem;
+}
+.banner-ok {
+    background: var(--green-lt);
+    border: 1.5px solid #6EE7B7;
+    border-radius: 10px;
+    padding: .65rem 1.1rem;
+    font-size: .82rem;
+    color: var(--green2);
+    margin-bottom: .9rem;
+}
+.banner-info {
+    background: var(--blue-lt);
+    border: 1.5px solid #93C5FD;
+    border-radius: 10px;
+    padding: .65rem 1.1rem;
+    font-size: .82rem;
+    color: #1E40AF;
+    margin-bottom: .9rem;
+}
+
+/* ── Upload gate ── */
+.upload-gate {
+    background: var(--white);
+    border: 2px dashed var(--border);
+    border-radius: 14px;
+    padding: 3rem 2rem;
+    text-align: center;
+    margin: 1.5rem 0;
+}
+
+/* ── Section label ── */
+.sec-label {
+    font-size: .68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--gray2);
+    margin-bottom: 4px;
+}
+
+/* ── Footer ── */
+.footer {
+    font-size: .7rem;
+    color: var(--gray3);
+    text-align: center;
+    margin-top: 2rem;
+    border-top: 1px solid var(--border);
+    padding-top: 1rem;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+OLLAMA_BASE = "http://localhost:11434"
+
+SYSTEM_PROMPT = """You are MedInsight AI, a clinical decision support system for licensed physicians.
+Return ONLY a single valid JSON object. No markdown. No preamble. No trailing text.
+
+RULES:
+- Decision support only — never replace clinical judgment.
+- Cite guidelines: AHA/ACC, ADA, NICE, ESC, WHO where applicable.
+- Provide differential diagnoses (never a single final diagnosis).
+- evidence_grade: A=strong RCT, B=observational, C=expert opinion.
+- confidence_percent: 0-100 per differential.
+
+JSON SCHEMA (return exactly this):
+{
+  "summary": "2-3 sentence clinical overview",
+  "risk_level": "CRITICAL|HIGH|MODERATE|LOW",
+  "risk_score": <0-100>,
+  "clinical_impression": "one-line key impression for the attending",
+  "urgent_flags": ["flag 1", "flag 2"],
+  "differentials": [
+    {
+      "condition": "name",
+      "probability": "High|Moderate|Low",
+      "confidence_percent": <0-100>,
+      "reasoning": "clinical rationale",
+      "icd10": "X00.0",
+      "key_features": ["feature 1", "feature 2"],
+      "against": "what argues against this"
+    }
+  ],
+  "lab_analysis": [
+    {
+      "parameter": "name",
+      "value": "value with units",
+      "reference": "normal range",
+      "status": "CRITICAL|HIGH|LOW|NORMAL",
+      "interpretation": "clinical significance",
+      "action_needed": true
+    }
+  ],
+  "risk_predictions": [
+    {
+      "condition": "complication",
+      "risk_percent": <0-100>,
+      "timeframe": "e.g. 10-year",
+      "basis": "Framingham / UKPDS / ADA",
+      "modifiable": true
+    }
+  ],
+  "recommendations": [
+    {
+      "priority": "URGENT|HIGH|MODERATE|ROUTINE",
+      "category": "Investigation|Medication|Referral|Monitoring|Lifestyle",
+      "action": "specific step",
+      "evidence": "guideline citation",
+      "evidence_grade": "A|B|C"
+    }
+  ],
+  "drug_interactions": [
+    {
+      "drugs": ["drug A", "drug B"],
+      "severity": "Major|Moderate|Minor",
+      "mechanism": "PK/PD explanation",
+      "effect": "clinical consequence",
+      "action": "recommended action",
+      "monitoring": "what to monitor"
+    }
+  ],
+  "follow_up": {
+    "timeframe": "e.g. 1 week",
+    "monitoring": ["param 1", "param 2"],
+    "red_flags": ["symptom requiring immediate review"]
+  },
+  "disclaimer": "Clinical decision support only."
+}"""
+
+DEMO_CASES = {
+    "— select demo —": None,
+    "Case 1 · Diabetic with chest pain (M/58)": {
+        "demographics": "Male, 58yr, smoker 30 pack-yr, BMI 31.2, sedentary",
+        "chief_complaint": "Exertional chest tightness x3 weeks, left arm radiation, dyspnea on stairs",
+        "history": "T2DM 12yr, HTN 8yr, Dyslipidemia. Father MI at 62.",
+        "vitals": "BP 158/96 | HR 88 | RR 18 | SpO2 97% | Temp 98.6F | Wt 89kg",
+        "symptoms": "Chest tightness, left arm radiation, exertional dyspnea, diaphoresis, fatigue",
+        "labs": "FBS 186 | HbA1c 8.4% | LDL 142 | HDL 38 | TG 198 | eGFR 61 | Cr 1.4 | Troponin I 0.06 ng/mL | BNP 210 pg/mL | ECG: ST depression V4-V6",
+        "medications": "Metformin 1000mg BD | Amlodipine 5mg OD | Atorvastatin 20mg OD",
+        "notes": "",
+    },
+    "Case 2 · Postpartum thyroid (F/32)": {
+        "demographics": "Female, 32yr, non-smoker, BMI 24.1, G1P1, delivered 8mo ago",
+        "chief_complaint": "Progressive fatigue, 6kg weight gain over 4mo, hair loss, cold intolerance",
+        "history": "No significant PMH. Mother: hypothyroidism.",
+        "vitals": "BP 108/70 | HR 62 | RR 16 | SpO2 99% | Temp 97.4F | Wt 68kg",
+        "symptoms": "Fatigue, weight gain, hair thinning, constipation, cold intolerance, brain fog, oligomenorrhea",
+        "labs": "TSH 12.4 | FT4 0.6 ng/dL | Anti-TPO 420 | Hb 10.2 MCV 78 | Ferritin 8 | B12 198",
+        "medications": "Prenatal vitamins stopped 3mo ago",
+        "notes": "",
+    },
+    "Case 3 · Elderly cognitive decline (M/74)": {
+        "demographics": "Male, 74yr, retired, BMI 26.8, ex-alcohol",
+        "chief_complaint": "Progressive memory loss 18mo, personality changes, getting lost",
+        "history": "HTN 20yr, AF 5yr, Prostate Ca remission 3yr, Depression",
+        "vitals": "BP 168/94 | HR 78 irregular | RR 16 | SpO2 96% | Wt 78kg",
+        "symptoms": "Memory loss, disorientation, personality change, word-finding difficulty",
+        "labs": "MMSE 19/30 | MoCA 17/30 | B12 188 | TSH 3.2 | eGFR 54 | INR 2.8 | MRI: hippocampal atrophy, WMC",
+        "medications": "Amlodipine 10mg | Warfarin 5mg | Escitalopram 10mg | Tamsulosin 0.4mg",
+        "notes": "",
+    },
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PDF REPORT GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+def generate_pdf_report(result: dict, patient: dict, meta: dict) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        topMargin=18*mm, bottomMargin=18*mm,
+        leftMargin=20*mm, rightMargin=20*mm,
+    )
+
+    # ── colours ──
+    C_GREEN  = colors.HexColor("#059669")
+    C_GREEN2 = colors.HexColor("#065F46")
+    C_NAVY   = colors.HexColor("#1E3A5F")
+    C_RED    = colors.HexColor("#DC2626")
+    C_ORANGE = colors.HexColor("#D97706")
+    C_BLUE   = colors.HexColor("#2563EB")
+    C_GRAY   = colors.HexColor("#374151")
+    C_GRAY2  = colors.HexColor("#6B7280")
+    C_LGR    = colors.HexColor("#F9FAFB")
+    C_BORDER = colors.HexColor("#D1D9E6")
+    C_GRLT   = colors.HexColor("#D1FAE5")
+    C_RDLT   = colors.HexColor("#FEE2E2")
+    C_ORLT   = colors.HexColor("#FEF3C7")
+    C_BLLT   = colors.HexColor("#DBEAFE")
+    WHITE    = colors.white
+
+    styles = getSampleStyleSheet()
+    W = A4[0] - 40*mm  # content width
+
+    def sty(name, **kw):
+        return ParagraphStyle(name, **{"fontName":"Helvetica","fontSize":9,"textColor":C_GRAY,"leading":13,**kw})
+
+    S = {
+        "title":    sty("title",    fontName="Helvetica-Bold", fontSize=18, textColor=C_NAVY, leading=22, spaceAfter=2),
+        "subtitle": sty("sub",      fontSize=8.5, textColor=C_GRAY2, spaceAfter=2),
+        "h2":       sty("h2",       fontName="Helvetica-Bold", fontSize=10, textColor=C_GREEN2, spaceBefore=10, spaceAfter=4, leading=14),
+        "h3":       sty("h3",       fontName="Helvetica-Bold", fontSize=9,  textColor=C_NAVY,   spaceBefore=6,  spaceAfter=3, leading=13),
+        "body":     sty("body",     fontSize=9,  textColor=C_GRAY,  leading=14, spaceAfter=3),
+        "bold":     sty("bold",     fontName="Helvetica-Bold", fontSize=9, textColor=C_GRAY, leading=13),
+        "small":    sty("small",    fontSize=7.5, textColor=C_GRAY2, leading=11),
+        "center":   sty("center",   fontSize=9,  alignment=TA_CENTER, textColor=C_GRAY),
+        "red":      sty("red",      fontName="Helvetica-Bold", fontSize=9,  textColor=C_RED),
+        "green":    sty("green",    fontName="Helvetica-Bold", fontSize=9,  textColor=C_GREEN),
+        "orange":   sty("orange",   fontName="Helvetica-Bold", fontSize=9,  textColor=C_ORANGE),
+        "blue":     sty("blue",     fontName="Helvetica-Bold", fontSize=9,  textColor=C_BLUE),
+        "imp":      sty("imp",      fontName="Helvetica-BoldOblique", fontSize=9, textColor=C_NAVY, leading=14),
+    }
+
+    def tbl_style(header_bg=C_GREEN, row_alt=C_LGR):
+        return TableStyle([
+            ("BACKGROUND",  (0,0), (-1,0), header_bg),
+            ("TEXTCOLOR",   (0,0), (-1,0), WHITE),
+            ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",    (0,0), (-1,0), 8.5),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[WHITE, row_alt]),
+            ("FONTSIZE",    (0,1), (-1,-1), 8.5),
+            ("TEXTCOLOR",   (0,1), (-1,-1), C_GRAY),
+            ("GRID",        (0,0), (-1,-1), 0.5, C_BORDER),
+            ("ROWPADDING",  (0,0), (-1,-1), 5),
+            ("VALIGN",      (0,0), (-1,-1), "TOP"),
+            ("TOPPADDING",  (0,0), (-1,-1), 5),
+            ("BOTTOMPADDING",(0,0),(-1,-1), 5),
+            ("LEFTPADDING", (0,0), (-1,-1), 7),
+            ("RIGHTPADDING",(0,0), (-1,-1), 7),
+        ])
+
+    story = []
+
+    # ── Header band ──
+    rl = result.get("risk_level","UNKNOWN")
+    rs = int(result.get("risk_score",0))
+    rl_color = {"CRITICAL":C_RED,"HIGH":C_ORANGE,"MODERATE":C_BLUE,"LOW":C_GREEN}.get(rl, C_GRAY)
+
+    hdr_data = [[
+        Paragraph("<b>⚕ MedInsight AI</b><br/><font size='7' color='#6B7280'>Clinical Decision Support Report</font>", sty("hh", fontName="Helvetica-Bold", fontSize=14, textColor=C_NAVY, leading=18)),
+        Paragraph(f"<b>RISK: {rl}</b><br/><font size='8' color='#6B7280'>Score {rs}/100</font>", sty("rl", fontName="Helvetica-Bold", fontSize=13, textColor=rl_color, alignment=TA_RIGHT, leading=18)),
+    ]]
+    hdr_tbl = Table(hdr_data, colWidths=[W*0.65, W*0.35])
+    hdr_tbl.setStyle(TableStyle([
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+        ("LINEBELOW",(0,0),(-1,0),1.5,C_GREEN),
+        ("TOPPADDING",(0,0),(-1,-1),6),
+        ("BOTTOMPADDING",(0,0),(-1,-1),8),
+    ]))
+    story.append(hdr_tbl)
+    story.append(Spacer(1, 4*mm))
+
+    # ── Meta row ──
+    story.append(Paragraph(
+        f"Generated: {meta.get('timestamp','')}  ·  Model: {meta.get('model','')}  ·  Inference: {meta.get('elapsed','')}s  ·  100% Local · Air-gapped",
+        sty("meta", fontSize=7.5, textColor=C_GRAY2)
+    ))
+    story.append(Spacer(1, 3*mm))
+
+    # ── Summary card ──
+    story.append(Paragraph("CLINICAL SUMMARY", S["h2"]))
+    ci = result.get("clinical_impression","")
+    summ_data = [
+        [Paragraph(result.get("summary","—"), S["body"])],
+    ]
+    if ci:
+        summ_data.append([Paragraph(f"<b>Impression:</b> {ci}", S["imp"])])
+    summ_tbl = Table(summ_data, colWidths=[W])
+    summ_tbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,-1),C_GRLT),
+        ("LEFTPADDING",(0,0),(-1,-1),10),
+        ("RIGHTPADDING",(0,0),(-1,-1),10),
+        ("TOPPADDING",(0,0),(-1,-1),7),
+        ("BOTTOMPADDING",(0,0),(-1,-1),7),
+        ("LINEAFTER",(0,0),(0,-1),3,C_GREEN),
+        ("GRID",(0,0),(-1,-1),0.3,C_BORDER),
+        ("ROUNDEDCORNERS",[4]),
+    ]))
+    story.append(summ_tbl)
+    story.append(Spacer(1, 3*mm))
+
+    # ── Urgent flags ──
+    flags = result.get("urgent_flags",[])
+    if flags:
+        story.append(Paragraph("URGENT FLAGS", S["h2"]))
+        fl_data = [[Paragraph(f"⚠  {f}", sty("fl", fontName="Helvetica-Bold", fontSize=9, textColor=C_RED, leading=14))] for f in flags]
+        fl_tbl = Table(fl_data, colWidths=[W])
+        fl_tbl.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,-1),C_RDLT),
+            ("LEFTPADDING",(0,0),(-1,-1),10),
+            ("TOPPADDING",(0,0),(-1,-1),5),
+            ("BOTTOMPADDING",(0,0),(-1,-1),5),
+            ("LINEAFTER",(0,0),(0,-1),3,C_RED),
+            ("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#FCA5A5")),
+        ]))
+        story.append(fl_tbl)
+        story.append(Spacer(1,3*mm))
+
+    # ── Differentials ──
+    diffs = result.get("differentials",[])
+    if diffs:
+        story.append(Paragraph("DIFFERENTIAL DIAGNOSES", S["h2"]))
+        d_data = [["#","Condition","Probability","Conf %","ICD-10","Reasoning"]]
+        for i, d in enumerate(diffs):
+            prob = d.get("probability","")
+            prob_style = {"High":"red","Moderate":"orange","Low":"green"}.get(prob,"body")
+            d_data.append([
+                Paragraph(str(i+1), S["center"]),
+                Paragraph(f"<b>{d.get('condition','')}</b>", S["bold"]),
+                Paragraph(prob, S[prob_style]),
+                Paragraph(f"{d.get('confidence_percent',0)}%", S["center"]),
+                Paragraph(d.get("icd10",""), S["small"]),
+                Paragraph(d.get("reasoning",""), S["body"]),
+            ])
+        d_tbl = Table(d_data, colWidths=[W*.04, W*.22, W*.1, W*.07, W*.08, W*.49])
+        d_tbl.setStyle(tbl_style())
+        story.append(d_tbl)
+        story.append(Spacer(1,3*mm))
+
+    # ── Lab Analysis ──
+    labs = result.get("lab_analysis",[])
+    if labs:
+        story.append(Paragraph("LABORATORY ANALYSIS", S["h2"]))
+        l_data = [["Parameter","Result","Reference Range","Status","Interpretation"]]
+        for lab in labs:
+            s = lab.get("status","NORMAL")
+            sc = {"CRITICAL":C_RED,"HIGH":C_ORANGE,"LOW":C_BLUE,"NORMAL":C_GREEN}.get(s,C_GRAY)
+            l_data.append([
+                Paragraph(f"<b>{lab.get('parameter','')}</b>", S["bold"]),
+                Paragraph(lab.get("value",""), sty("lv", fontName="Helvetica-Bold", fontSize=9, textColor=sc)),
+                Paragraph(lab.get("reference",""), S["small"]),
+                Paragraph(f"<b>{s}</b>", sty("ls", fontName="Helvetica-Bold", fontSize=8.5, textColor=sc)),
+                Paragraph(lab.get("interpretation",""), S["body"]),
+            ])
+        l_tbl = Table(l_data, colWidths=[W*.2, W*.12, W*.15, W*.1, W*.43])
+        l_tbl.setStyle(tbl_style())
+        story.append(l_tbl)
+        story.append(Spacer(1,3*mm))
+
+    # ── Risk Predictions ──
+    risks = result.get("risk_predictions",[])
+    if risks:
+        story.append(Paragraph("RISK PREDICTIONS", S["h2"]))
+        r_data = [["Condition","Risk %","Timeframe","Evidence Basis","Modifiable"]]
+        for rp in risks:
+            pct = int(rp.get("risk_percent",0))
+            pc = C_RED if pct>65 else C_ORANGE if pct>35 else C_GREEN
+            r_data.append([
+                Paragraph(rp.get("condition",""), S["bold"]),
+                Paragraph(f"<b>{pct}%</b>", sty("rp", fontName="Helvetica-Bold", fontSize=10, textColor=pc)),
+                Paragraph(rp.get("timeframe",""), S["body"]),
+                Paragraph(rp.get("basis",""), S["small"]),
+                Paragraph("Yes" if rp.get("modifiable") else "No", S["body"]),
+            ])
+        r_tbl = Table(r_data, colWidths=[W*.25, W*.1, W*.15, W*.35, W*.15])
+        r_tbl.setStyle(tbl_style())
+        story.append(r_tbl)
+        story.append(Spacer(1,3*mm))
+
+    # ── Recommendations ──
+    recs = result.get("recommendations",[])
+    if recs:
+        story.append(Paragraph("CLINICAL RECOMMENDATIONS", S["h2"]))
+        rec_data = [["Priority","Category","Action","Evidence","Grade"]]
+        for rec in recs:
+            p = rec.get("priority","")
+            pc = {"URGENT":C_RED,"HIGH":C_ORANGE,"MODERATE":C_BLUE,"ROUTINE":C_GREEN}.get(p,C_GRAY)
+            rec_data.append([
+                Paragraph(f"<b>{p}</b>", sty("rp2", fontName="Helvetica-Bold", fontSize=8.5, textColor=pc)),
+                Paragraph(rec.get("category",""), S["body"]),
+                Paragraph(rec.get("action",""), S["body"]),
+                Paragraph(rec.get("evidence",""), S["small"]),
+                Paragraph(rec.get("evidence_grade",""), S["center"]),
+            ])
+        rec_tbl = Table(rec_data, colWidths=[W*.1, W*.13, W*.38, W*.33, W*.06])
+        rec_tbl.setStyle(tbl_style())
+        story.append(rec_tbl)
+        story.append(Spacer(1,3*mm))
+
+    # ── Drug Interactions ──
+    ixns = result.get("drug_interactions",[])
+    if ixns:
+        story.append(Paragraph("DRUG INTERACTIONS", S["h2"]))
+        ix_data = [["Drugs","Severity","Effect","Action","Monitor"]]
+        for ix in ixns:
+            sv = ix.get("severity","")
+            sc = {"Major":C_RED,"Moderate":C_ORANGE,"Minor":C_BLUE}.get(sv,C_GRAY)
+            ix_data.append([
+                Paragraph(" + ".join(ix.get("drugs",[])), S["bold"]),
+                Paragraph(f"<b>{sv}</b>", sty("sv", fontName="Helvetica-Bold", fontSize=8.5, textColor=sc)),
+                Paragraph(ix.get("effect",""), S["body"]),
+                Paragraph(ix.get("action",""), S["body"]),
+                Paragraph(ix.get("monitoring",""), S["small"]),
+            ])
+        ix_tbl = Table(ix_data, colWidths=[W*.2, W*.1, W*.25, W*.25, W*.2])
+        ix_tbl.setStyle(tbl_style())
+        story.append(ix_tbl)
+        story.append(Spacer(1,3*mm))
+
+    # ── Follow-up ──
+    fu = result.get("follow_up",{})
+    if fu:
+        story.append(Paragraph("FOLLOW-UP PLAN", S["h2"]))
+        fu_rows = [
+            [Paragraph("<b>Timeframe</b>", S["bold"]), Paragraph(fu.get("timeframe","—"), S["body"])],
+            [Paragraph("<b>Monitor</b>", S["bold"]),   Paragraph("  ·  ".join(fu.get("monitoring",[])), S["body"])],
+        ]
+        if fu.get("red_flags"):
+            fu_rows.append([Paragraph("<b>Red Flags</b>", S["bold"]), Paragraph("  ·  ".join(fu.get("red_flags",[])), S["red"])])
+        fu_tbl = Table(fu_rows, colWidths=[W*.2, W*.8])
+        fu_tbl.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(0,-1),C_GRLT),
+            ("GRID",(0,0),(-1,-1),0.5,C_BORDER),
+            ("TOPPADDING",(0,0),(-1,-1),6),
+            ("BOTTOMPADDING",(0,0),(-1,-1),6),
+            ("LEFTPADDING",(0,0),(-1,-1),8),
+        ]))
+        story.append(fu_tbl)
+        story.append(Spacer(1,4*mm))
+
+    # ── Patient data reference ──
+    story.append(HRFlowable(width=W, thickness=0.5, color=C_BORDER))
+    story.append(Spacer(1,2*mm))
+    story.append(Paragraph("PATIENT DATA USED FOR THIS ANALYSIS", sty("pd_hd", fontName="Helvetica-Bold", fontSize=8, textColor=C_GRAY2, spaceAfter=3)))
+    fields = ["demographics","chief_complaint","history","vitals","symptoms","labs","medications","notes"]
+    labels = ["Demographics","Chief Complaint","History","Vitals","Symptoms","Labs","Medications","Notes"]
+    pd_data = [[Paragraph(f"<b>{l}</b>", S["small"]), Paragraph(patient.get(f,"—") or "—", S["small"])]
+               for f, l in zip(fields, labels) if patient.get(f,"").strip()]
+    if pd_data:
+        pd_tbl = Table(pd_data, colWidths=[W*.2, W*.8])
+        pd_tbl.setStyle(TableStyle([
+            ("GRID",(0,0),(-1,-1),0.3,C_BORDER),
+            ("TOPPADDING",(0,0),(-1,-1),4),
+            ("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING",(0,0),(-1,-1),6),
+            ("ROWBACKGROUNDS",(0,0),(-1,-1),[WHITE,C_GRLT]),
+        ]))
+        story.append(pd_tbl)
+
+    # ── Disclaimer footer ──
+    story.append(Spacer(1,4*mm))
+    story.append(HRFlowable(width=W, thickness=1, color=C_GREEN))
+    story.append(Spacer(1,2*mm))
+    story.append(Paragraph(
+        "⚠  CLINICAL DECISION SUPPORT ONLY — FOR LICENSED PHYSICIAN USE  ⚠  "
+        "This report is generated by an AI model running locally on-device (Ollama). "
+        "All outputs must be reviewed and validated by a licensed clinician before any clinical action. "
+        "This report does not constitute a diagnosis, prescription, or medical advice.",
+        sty("disc", fontSize=7, textColor=C_GRAY2, alignment=TA_CENTER, leading=11)
+    ))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOCUMENT EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
+def extract_file(uploaded_file) -> tuple[str, str]:
+    name = uploaded_file.name.lower()
+    raw  = uploaded_file.read()
+    if name.endswith(".pdf"):
+        if not HAS_PDF: return "", "Install pymupdf: pip install pymupdf"
+        try:
+            doc  = fitz.open(stream=raw, filetype="pdf")
+            text = "".join(p.get_text() for p in doc)
+            return text.strip(), f"PDF ({doc.page_count}p)"
+        except Exception as e: return "", str(e)
+    elif name.endswith(".docx"):
+        if not HAS_DOCX: return "", "Install python-docx"
+        try:
+            d = DocxDoc(io.BytesIO(raw))
+            WNS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+            parts = []
+            for child in d.element.body:
+                tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if tag == "p":
+                    para_text = "".join(
+                        node.text or "" for node in child.iter()
+                        if node.tag.endswith("}t")
+                    ).strip()
+                    if para_text:
+                        parts.append(para_text)
+                elif tag == "tbl":
+                    for row in child.findall(".//{" + WNS[1:-1] + "}tr"):
+                        cells = []
+                        for cell in row.findall(".//{" + WNS[1:-1] + "}tc"):
+                            ct = "".join(node.text or "" for node in cell.iter() if node.tag.endswith("}t")).strip()
+                            if ct:
+                                cells.append(ct)
+                        if len(cells) == 1:
+                            parts.append(cells[0])
+                        elif len(cells) == 2:
+                            parts.append(f"{cells[0]}: {cells[1]}")
+                        elif len(cells) >= 3:
+                            parts.append(" | ".join(cells))
+            text = "\n".join(parts)
+            return text.strip(), f"DOCX (paragraphs + {len(d.tables)} tables)"
+        except Exception as e: return "", str(e)
+    elif name.endswith((".txt",".md",".csv",".log")):
+        return raw.decode("utf-8","replace").strip(), "Plain text"
+    elif name.endswith((".png",".jpg",".jpeg",".bmp",".tiff",".webp")):
+        if not HAS_OCR: return "", "Install pytesseract + Pillow"
+        try:
+            text = pytesseract.image_to_string(Image.open(io.BytesIO(raw)))
+            return text.strip(), "Image OCR"
+        except Exception as e: return "", str(e)
+    return "", f"Unsupported: {Path(name).suffix}"
+
+def smart_parse(text: str) -> dict:
+    """
+    Section-aware medical document parser v3.
+    Maps document sections to patient form fields cleanly.
+    """
+    fields = {k: "" for k in
+              ["demographics", "chief_complaint", "history",
+               "vitals", "symptoms", "labs", "medications", "notes"]}
+    if not text:
+        return fields
+
+    JUNK_PAT = re.compile(
+        r"^(===.*===|CONFIDENTIAL|PATIENT MEDICAL RECORD$"
+        r"|City General Hospital|Department of Internal Medicine"
+        r"|MRN:.*Prepared:|FOR CLINICAL USE ONLY|Page \d+)",
+        re.IGNORECASE
+    )
+    TABLE_HDR_PAT = re.compile(
+        r"^(Parameter|Result|Reference|Status|Drug|Dose|Frequency|Indication"
+        r"|Value|Test|Finding|Measurement)\s*\|",
+        re.IGNORECASE
+    )
+
+    SECTION_MAP = [
+        (r"PATIENT\s+DEMOGRAPHICS?",                        "demographics"),
+        (r"DEMOGRAPHICS?\b",                                "demographics"),
+        (r"PERSONAL\s+INFO",                                "demographics"),
+        (r"CHIEF\s+COMPLAINT",                              "chief_complaint"),
+        (r"PRESENTING\s+(COMPLAINT|HISTORY|ILLNESS)",       "chief_complaint"),
+        (r"HISTORY\s+OF\s+PRESENTING",                     "chief_complaint"),
+        (r"REASON\s+FOR\s+(VISIT|REFERRAL)",               "chief_complaint"),
+        (r"PAST\s+MEDICAL.*SURGICAL.*HISTORY",              "history"),
+        (r"PAST\s+MEDICAL.*HISTORY",                        "history"),
+        (r"MEDICAL\s+(HISTORY|BACKGROUND)",                 "history"),
+        (r"SURGICAL\s+HISTORY",                             "history"),
+        (r"FAMILY\s+HISTORY",                               "history"),
+        (r"SOCIAL\s+HISTORY",                               "history"),
+        (r"VITAL\s+SIGNS?\s*(ON\s+ADMISSION)?",           "vitals"),
+        (r"VITALS?\b",                                      "vitals"),
+        (r"PHYSICAL\s+EXAM(INATION)?",                      "vitals"),
+        (r"OBSERVATIONS?\b",                                "vitals"),
+        (r"SYMPTOMS?\b",                                    "symptoms"),
+        (r"REVIEW\s+OF\s+SYSTEMS?",                        "symptoms"),
+        (r"PRESENTING\s+SYMPTOMS?",                         "symptoms"),
+        (r"COMPLAINTS?\b",                                  "symptoms"),
+        (r"LABORATORY\s+(INVESTIGATIONS?|RESULTS?|FINDINGS?|TESTS?)", "labs"),
+        (r"LAB(ORATORY)?\s+(RESULTS?|VALUES?|DATA|PANEL)", "labs"),
+        (r"INVESTIGATIONS?\b",                              "labs"),
+        (r"DIAGNOSTIC\s+(RESULTS?|FINDINGS?|WORKUP)",       "labs"),
+        (r"ELECTROCARDIOGRAM|ECG\b|IMAGING\b",             "labs"),
+        (r"HAEMATOLOGY|HEMATOLOGY|BIOCHEMISTRY",             "labs"),
+        (r"CARDIAC\s+BIOMARKERS?",                          "labs"),
+        (r"METABOLIC\s+PANEL",                              "labs"),
+        (r"CURRENT\s+MEDICATIONS?",                         "medications"),
+        (r"MEDICATIONS?\s*(LIST|PRESCRIBED|ON\s+ADMISSION)?","medications"),
+        (r"PRESCRIPTION(S)?\b",                             "medications"),
+        (r"DRUGS?\s*(LIST|PRESCRIBED|CURRENT)",             "medications"),
+        (r"PHYSICIAN\s+(CLINICAL\s+)?IMPRESSION",          "notes"),
+        (r"CLINICAL\s+(IMPRESSION|NOTES?|SUMMARY)",         "notes"),
+        (r"ASSESSMENT\s+AND\s+PLAN",                       "notes"),
+        (r"PENDING\s*/\s*PLANNED",                         "notes"),
+    ]
+
+    DEMO_KV_PAT = re.compile(
+        r"^(Full\s+Name|Name|Patient(\s+Name)?|Date\s+of\s+Birth|DOB"
+        r"|Age|Sex|Gender|Weight\s*/\s*BMI|BMI|Occupation|Job"
+        r"|MRN|Ward|Bed|Attending|Date\s+of\s+Admission|Admission\s+Date"
+        r"|Smoking(\s+History)?|Alcohol|Marital|Nationality)\s*:",
+        re.IGNORECASE
+    )
+    VITAL_DATA_PAT = re.compile(
+        r"\b(Blood\s+Pressure|BP|Pulse|Heart\s+Rate|HR|Respiratory\s+Rate|RR"
+        r"|SpO2|O2\s+Sat|Temperature|Temp|Weight|Height|BMI)\b"
+        r".{0,30}[\d\.]+\s*(mmHg|bpm|breaths/min|%|[°]?[CF]|kg|cm)",
+        re.IGNORECASE
+    )
+    LAB_DATA_PAT = re.compile(
+        r"\b(HbA1c|Haemoglobin|Hemoglobin|Hb\b|WBC|Platelets?"
+        r"|Creatinine|eGFR|BUN|Urea\b|Sodium|Potassium|Chloride"
+        r"|LDL|HDL|Triglycerides?|Total\s+Cholesterol"
+        r"|BNP|Troponin|CK.?MB|D.?Dimer|INR|PT\b|APTT"
+        r"|TSH|FT4|FT3|Anti.?TPO|Prolactin|FSH|LH|Cortisol"
+        r"|Ferritin|Iron\b|Folate|Vitamin\s+B12|B12\b"
+        r"|ALT|AST|ALP|GGT|Bilirubin|Albumin"
+        r"|Fasting\s+Blood\s+Sugar|FBS|Blood\s+Glucose|HBA1C"
+        r"|MMSE|MoCA|PSA|AFP|CEA)\b"
+        r".{0,20}[\d\.]+",
+        re.IGNORECASE
+    )
+    MED_DATA_PAT = re.compile(
+        r"\b(Metformin|Amlodipine|Atorvastatin|Lisinopril|Losartan"
+        r"|Aspirin|Clopidogrel|Warfarin|Levothyroxine|Insulin"
+        r"|Escitalopram|Sertraline|Omeprazole|Pantoprazole"
+        r"|Metoprolol|Bisoprolol|Furosemide|Spironolactone|Tamsulosin"
+        r"|Paracetamol|Ibuprofen|Diclofenac|Prednisone|Prednisolone"
+        r"|Amoxicillin|Azithromycin|Ramipril|Enalapril|Valsartan"
+        r"|\w+statin|\w+pril|\w+sartan|\w+olol|\w+pine|\w+mide"
+        r"|\w+zide|\w+mycin|\w+cillin|\w+oxacin|\w+azole|\w+prazole"
+        r"|\w+tidine|\w+gliptin|\w+formin|\w+insulin)\b"
+        r".{0,30}\d+\s*(mg|mcg|g\b|ml|IU|units?)",
+        re.IGNORECASE
+    )
+
+    lines = text.split("\n")
+    current_section = None
+    section_content = {k: [] for k in fields}
+
+    def detect_header(line):
+        s = line.strip().rstrip(":.\u2014\u2013-")
+        if not s or len(s) > 100:
+            return None
+        if re.search(r"\d+\s*(mg|mmHg|bpm|%|ng|pg|mL|IU|kg|g/dL|U/L|mEq)", s):
+            return None
+        if s.count("|") >= 2 and re.search(r"\d", s):
+            return None
+        clean = re.sub(r"^[\d]+\.[\d]*\s+", "", s)
+        clean = re.sub(r"^\d+\.\s+", "", clean)
+        for pat, key in SECTION_MAP:
+            if re.search(pat, clean, re.IGNORECASE):
+                return key
+        return None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if JUNK_PAT.search(line):
+            continue
+        if TABLE_HDR_PAT.search(line) and not re.search(r"\d", line):
+            continue
+
+        detected = detect_header(line)
+        if detected:
+            if detected == "notes" and current_section in (
+                    "vitals","labs","medications","symptoms",
+                    "history","chief_complaint","demographics"):
+                section_content[current_section].append(line)
+            else:
+                current_section = detected
+            continue
+
+        if current_section:
+            section_content[current_section].append(line)
+        else:
+            if DEMO_KV_PAT.match(line):
+                section_content["demographics"].append(line)
+            elif VITAL_DATA_PAT.search(line):
+                section_content["vitals"].append(line)
+            elif LAB_DATA_PAT.search(line):
+                section_content["labs"].append(line)
+            elif MED_DATA_PAT.search(line):
+                section_content["medications"].append(line)
+
+    if not section_content["vitals"]:
+        for ln in lines:
+            if VITAL_DATA_PAT.search(ln) and not TABLE_HDR_PAT.search(ln):
+                section_content["vitals"].append(ln.strip())
+    if not section_content["labs"]:
+        for ln in lines:
+            if LAB_DATA_PAT.search(ln):
+                section_content["labs"].append(ln.strip())
+    if not section_content["medications"]:
+        for ln in lines:
+            if MED_DATA_PAT.search(ln):
+                section_content["medications"].append(ln.strip())
+
+    def clean_vitals(lst):
+        out = []
+        for ln in lst:
+            ln = ln.strip()
+            if TABLE_HDR_PAT.search(ln) and not re.search(r"\d", ln):
+                continue
+            if "|" in ln and not re.search(r"\d", ln):
+                continue
+            ln = re.sub(r"\s*[|]\s*([\u2713\u26a0]|\xe2\x9c\x93|\xe2\x9a\xa0)\s*(NORMAL|HIGH|LOW|CRITICAL)\s*$", "", ln)
+            ln = re.sub(r"\s+[\u2713\u26a0\u2714]\s*(NORMAL|HIGH|LOW|CRITICAL)", "", ln)
+            ln = re.sub(r"\s*\|\s*(NORMAL|HIGH|LOW|CRITICAL)\s*$", "", ln)
+            if ln.strip():
+                out.append(ln.strip())
+        return out
+
+    def clean_labs(lst):
+        out, seen = [], set()
+        for ln in lst:
+            ln = ln.strip()
+            if TABLE_HDR_PAT.search(ln) and not re.search(r"\d", ln):
+                continue
+            if ln and ln not in seen:
+                seen.add(ln); out.append(ln)
+        return out
+
+    def clean_meds(lst):
+        out = []
+        for ln in lst:
+            ln = ln.strip()
+            if re.match(r"^(Drug|Medication)\s*\|", ln, re.IGNORECASE):
+                continue
+            # Drop section-header lines that leaked in (e.g. "8. PHYSICIAN CLINICAL IMPRESSION")
+            if re.match(r"^\d+[\. ]+[A-Z][A-Z\s]+$", ln):
+                continue
+            if re.search(r"PHYSICIAN|CLINICAL IMPRESSION|ASSESSMENT\s+AND\s+PLAN", ln, re.IGNORECASE):
+                continue
+            # Every real medication line has a dose number
+            if not re.search(r"\d", ln):
+                continue
+            if ln:
+                out.append(ln)
+        return out
+
+    def clean_demographics(lst):
+        # Split fused lines like "Full Name: JohnDate of Birth: 1990"
+        LABELS = (r"(Full\s+Name|Name|Date\s+of\s+Birth|DOB|Age|Sex|Gender"
+                  r"|Weight\s*/\s*BMI|BMI|Occupation|MRN|Ward|Bed"
+                  r"|Attending|Date\s+of\s+Admission|Smoking(\s+History)?"
+                  r"|Alcohol|Marital|Nationality|Allergies|Immunisations?|Surgical\s+History)")
+        split_pat = re.compile(r"(?<=[a-z0-9\)])(?=" + LABELS + r"\s*:)", re.IGNORECASE)
+        out = []
+        for ln in lst:
+            parts = split_pat.split(ln.strip())
+            for p in parts:
+                p = p.strip()
+                if p:
+                    out.append(p)
+        return out
+
+    def join_unique(lst, sep, limit):
+        seen, out = set(), []
+        for ln in lst[:limit]:
+            ln = ln.strip()
+            if ln and ln not in seen:
+                seen.add(ln); out.append(ln)
+        return sep.join(out)
+
+    fields["demographics"]    = join_unique(clean_demographics(section_content["demographics"]), "\n", 15)
+    fields["chief_complaint"] = join_unique(section_content["chief_complaint"], "\n", 10)
+    fields["history"]         = join_unique(section_content["history"],         "\n", 15)
+    fields["vitals"]          = join_unique(clean_vitals(section_content["vitals"]), " | ", 10)
+    fields["symptoms"]        = join_unique(section_content["symptoms"],        "\n", 12)
+    fields["labs"]            = join_unique(clean_labs(section_content["labs"]), " | ", 20)
+    fields["medications"]     = join_unique(clean_meds(section_content["medications"]), "\n", 15)
+    fields["notes"]           = join_unique(section_content["notes"],           "\n", 12)
+
+    if not fields["symptoms"] and fields["chief_complaint"]:
+        symp_lines = [
+            ln for ln in section_content["chief_complaint"]
+            if re.search(r"(tightness|pain|ache|dyspnoea|dyspnea|fatigue"
+                         r"|diaphoresis|nausea|vomit|dizziness|syncope"
+                         r"|palpitation|swelling|fever|cough|headache"
+                         r"|weakness|numbness|tingling|loss\s+of)", ln, re.IGNORECASE)
+        ]
+        fields["symptoms"] = join_unique(symp_lines, "\n", 10)
+
+    if not any(v.strip() for v in fields.values()):
+        fields["notes"] = text[:3000]
+
+    return fields
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OLLAMA HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def get_models():
+    try:
+        r = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=3)
+        return [m["name"] for m in r.json().get("models",[])] if r.ok else []
+    except: return []
+
+def ollama_ok():
+    try: return requests.get(f"{OLLAMA_BASE}/api/tags", timeout=2).ok
+    except: return False
+
+def fix_json(raw: str) -> str:
+    """Repair malformed JSON from LLMs before parsing."""
+
+    # 1. Strip markdown fences
+    if "```" in raw:
+        for part in raw.split("```"):
+            p = part.strip()
+            if p.startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("{"):
+                raw = p
+                break
+
+    # 2. Trim to outermost { ... }
+    s = raw.find("{")
+    e = raw.rfind("}")
+    if s != -1 and e != -1 and e > s:
+        raw = raw[s:e+1]
+    elif s != -1:
+        raw = raw[s:]  # truncated output — close below
+
+    # 3. Replace curly/smart quotes with straight ASCII quotes
+    QUOTE_MAP = [
+        ("\u201c", '"'), ("\u201d", '"'),
+        ("\u2018", "'"), ("\u2019", "'"),
+        ("\u2032", "'"), ("\u00b4", "'"),
+    ]
+    for bad, good in QUOTE_MAP:
+        raw = raw.replace(bad, good)
+
+    # 4. Remove JS-style // comments
+    raw = re.sub(r'(?m)(?<![:\"])//[^\n]*', '', raw)
+
+    # 5. Fix trailing commas before } or ]
+    raw = re.sub(r',(\s*[}\]])', r'\1', raw)
+
+    # 6. Escape bare newlines/carriage-returns/tabs inside JSON string values.
+    #    We match quoted strings and replace literal control chars inside them.
+    def escape_string_internals(m):
+        inner = m.group(0)
+        inner = inner.replace('\r\n', '\\n').replace('\r', '\\n').replace('\n', '\\n')
+        inner = inner.replace('\t', '\\t')
+        return inner
+    raw = re.sub(r'"(?:[^"\\]|\\.)*"', escape_string_internals, raw, flags=re.DOTALL)
+
+    # 7. Fix missing commas between consecutive string values in arrays
+    #    Model sometimes emits ["item1"\n    "item2"] without a comma
+    raw = re.sub(r'"(\s*)\n(\s*)"', '",\\n"', raw)
+
+    # 8. If result has no opening {, wrap it (happens when smart-quote
+    #    replacement strips the leading character that wasn't a real {)
+    stripped = raw.strip()
+    if stripped and not stripped.startswith("{"):
+        # Try to find a { inside
+        brace = raw.find("{")
+        if brace != -1:
+            raw = raw[brace:]
+        else:
+            raw = "{" + raw
+    # Ensure it ends with }
+    if not raw.rstrip().endswith("}"):
+        raw = raw.rstrip().rstrip(",") + "}"
+
+    # 9. Attempt to close truncated JSON
+    if raw.count("{") > raw.count("}") or raw.count("[") > raw.count("]"):
+        raw = re.sub(r',\s*"[^"]*"\s*:\s*[^,}\]]*$', '', raw.rstrip())
+        raw = re.sub(r',\s*$', '', raw.rstrip())
+        opens  = max(0, raw.count("{") - raw.count("}"))
+        aopens = max(0, raw.count("[") - raw.count("]"))
+        raw += "]" * aopens + "}" * opens
+
+    # 10. Final trailing-comma pass
+    raw = re.sub(r',(\s*[}\]])', r'\1', raw)
+
+    return raw
+
+
+def run_ollama(model, patient, timeout=180):
+    msg = f"""Analyze this patient and return ONLY a valid JSON object. No explanation. No markdown.
+
+Demographics:    {patient.get('demographics','—')}
+Chief Complaint: {patient.get('chief_complaint','—')}
+History:         {patient.get('history','—')}
+Vitals:          {patient.get('vitals','—')}
+Symptoms:        {patient.get('symptoms','—')}
+Labs/Imaging:    {patient.get('labs','—')}
+Medications:     {patient.get('medications','—')}
+Notes:           {patient.get('notes','—')}
+
+Respond with JSON only, starting with {{ and ending with }}. No text before or after."""
+
+    raw = ""
+    try:
+        r = requests.post(f"{OLLAMA_BASE}/api/generate", timeout=timeout, json={
+            "model": model, "system": SYSTEM_PROMPT, "prompt": msg, "stream": False,
+            "options": {"temperature": 0.05, "top_p": 0.9, "num_predict": 4096,
+                        "repeat_penalty": 1.05},
+        })
+        r.raise_for_status()
+        resp = r.json()
+        raw  = resp.get("response", "").strip()
+        tps  = round(resp.get("eval_count", 0) / max(resp.get("eval_duration", 1) / 1e9, 0.1), 1)
+
+        # ── Attempt 1: direct parse ─────────────────────────────────────────
+        fixed = fix_json(raw)
+        try:
+            return json.loads(fixed), tps
+        except json.JSONDecodeError:
+            pass
+
+        # ── Attempt 2: stripped parse (remove non-printable chars) ──────────
+        cleaned = re.sub(r'[--]', '', fixed)
+        try:
+            return json.loads(cleaned), tps
+        except json.JSONDecodeError:
+            pass
+
+        # ── Attempt 3: retry with even simpler prompt + smaller output ───────
+        st.warning("⚠️ First attempt had malformed JSON — retrying with simplified prompt…")
+        simple_msg = f"""Patient: {patient.get('demographics','')}. 
+Complaint: {patient.get('chief_complaint','')}. 
+Labs: {patient.get('labs','')}. 
+Meds: {patient.get('medications','')}.
+Return ONLY JSON matching the schema. Start with {{ end with }}."""
+
+        r2 = requests.post(f"{OLLAMA_BASE}/api/generate", timeout=timeout, json={
+            "model": model, "system": SYSTEM_PROMPT, "prompt": simple_msg, "stream": False,
+            "options": {"temperature": 0.0, "num_predict": 3000},
+        })
+        r2.raise_for_status()
+        raw2  = r2.json().get("response", "").strip()
+        fixed2 = fix_json(raw2)
+        try:
+            return json.loads(fixed2), tps
+        except json.JSONDecodeError as e2:
+            st.error(f"JSON parse error after retry: {e2}")
+            with st.expander("🔍 Raw model output (for debugging)"):
+                st.code(raw[:3000], language="text")
+
+    except requests.exceptions.ConnectionError:
+        st.error("❌  Ollama not running. Run: `ollama serve`")
+    except requests.exceptions.Timeout:
+        st.error(f"⏱  Timed out ({timeout}s). Try a smaller model or raise the timeout slider.")
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
+        if raw:
+            with st.expander("🔍 Raw model output"):
+                st.code(raw[:2000], language="text")
+    return None, 0.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BADGE / CHIP HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def badge(text, cls): return f'<span class="badge b-{cls}">{text}</span>'
+
+def rl_badge(rl):
+    c = {"CRITICAL":"red","HIGH":"orange","MODERATE":"blue","LOW":"green"}.get(rl,"gray")
+    return badge(rl, c)
+
+def rl_color(rl):
+    return {"CRITICAL":"#DC2626","HIGH":"#D97706","MODERATE":"#2563EB","LOW":"#059669"}.get(rl,"#6B7280")
+
+def status_badge(s):
+    c = {"CRITICAL":"red","HIGH":"orange","LOW":"blue","NORMAL":"green"}.get(s,"gray")
+    return badge(s, c)
+
+def prob_badge(p):
+    c = {"High":"red","Moderate":"orange","Low":"green"}.get(p,"gray")
+    return badge(p, c)
+
+def prio_badge(p):
+    c = {"URGENT":"red","HIGH":"orange","MODERATE":"blue","ROUTINE":"green"}.get(p,"gray")
+    return badge(p, c)
+
+def sev_badge(s):
+    c = {"Major":"red","Moderate":"orange","Minor":"blue"}.get(s,"gray")
+    return badge(s, c)
+
+def grade_badge(g):
+    c = {"A":"green","B":"blue","C":"gray"}.get(g,"gray")
+    return badge(f"Grade {g}", c)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("""
+    <div style="padding:1.2rem 0 1rem; border-bottom:1.5px solid #D1D9E6; margin-bottom:1rem;">
+        <div style="display:flex;align-items:center;gap:10px;">
+            <div style="font-size:2rem;">🩺</div>
+            <div>
+                <div style="font-weight:800;font-size:1.1rem;color:#111827;">MedInsight AI</div>
+                <div style="font-size:.68rem;color:#6B7280;letter-spacing:.08em;text-transform:uppercase;">v4 · 100% Local</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    ok = ollama_ok()
+    st.markdown(f"""
+    <div style="display:flex;align-items:center;gap:7px;font-size:.8rem;
+         color:{'#059669' if ok else '#DC2626'};margin-bottom:1rem;
+         background:{'#D1FAE5' if ok else '#FEE2E2'};padding:.5rem .8rem;
+         border-radius:8px;border:1px solid {'#6EE7B7' if ok else '#FCA5A5'};">
+        <div style="width:8px;height:8px;border-radius:50%;background:{'#059669' if ok else '#DC2626'};"></div>
+        {'Ollama running' if ok else 'Ollama offline — run: ollama serve'}
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("### 🤖 Model")
+    avail = get_models()
+    REC   = ["llama3.1:8b","llama3.2:3b","mistral:7b","mistral-nemo:12b","phi3:medium","gemma2:9b"]
+    opts  = avail + [m for m in REC if m not in avail]
+    model = st.selectbox("model", opts if opts else REC, label_visibility="collapsed")
+    if model in avail:
+        st.markdown(f'<div style="font-size:.76rem;color:#059669;">✓ {model} ready</div>', unsafe_allow_html=True)
+    else:
+        st.warning(f"`ollama pull {model}`")
+
+    timeout = st.slider("Timeout (s)", 60, 300, 180, 10)
+
+    st.markdown("### 🗂 Demo Cases")
+    demo_choice = st.selectbox("demo", list(DEMO_CASES.keys()), label_visibility="collapsed")
+
+    st.markdown("### 🔧 Modules")
+    MODS = ["🧬 Differentials","🔬 Labs","📊 Risk","💊 Drugs","📋 Recs"]
+    active = {m: st.checkbox(m, value=True) for m in MODS}
+
+    st.markdown("---")
+    with st.expander("📦 Pull a model"):
+        st.code("ollama pull llama3.2:3b\nollama pull llama3.1:8b\nollama pull mistral:7b")
+
+    st.markdown("""
+    <div style="font-size:.7rem;color:#6B7280;background:#FEF3C7;border:1px solid #FCD34D;
+         border-radius:8px;padding:.6rem .8rem;margin-top:.5rem;line-height:1.6;">
+        <b style="color:#92400E;">⚠ Physician use only.</b>
+        Decision support tool — not a replacement for clinical judgment.
+    </div>
+    """, unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN HEADER
+# ══════════════════════════════════════════════════════════════════════════════
+col_h1, col_h2 = st.columns([3,1])
+with col_h1:
+    st.markdown("""
+    <div style="margin-bottom:.5rem;">
+        <h1 style="margin:0;">Clinical Decision Support</h1>
+        <p style="color:#6B7280;margin:.3rem 0 0;font-size:.88rem;">
+            Upload a medical document to auto-extract patient data, then run AI analysis locally.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+with col_h2:
+    st.markdown("""
+    <div style="display:flex;gap:6px;flex-wrap:wrap;padding-top:.8rem;justify-content:flex-end;">
+        <span class="badge b-green">100% Local</span>
+        <span class="badge b-blue">Ollama</span>
+        <span class="badge b-gray">v4</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+st.markdown("""
+<div class="banner-warn">
+    ⚠️  <b>For licensed physicians only.</b>
+    MedInsight AI is a clinical decision support tool.
+    All outputs must be validated by a licensed clinician before any clinical action is taken.
+</div>
+""", unsafe_allow_html=True)
+
+demo = DEMO_CASES.get(demo_choice) or {}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TABS
+# ══════════════════════════════════════════════════════════════════════════════
+t1, t2, t3, t4 = st.tabs(["📎 Upload Document", "📝 Patient Data", "📊 Analysis", "📂 History"])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 1 — UPLOAD
+# ─────────────────────────────────────────────────────────────────────────────
+with t1:
+    st.markdown("## 📎 Upload Medical Document")
+    st.markdown('<p style="color:#6B7280;font-size:.88rem;">Upload any medical document — text is extracted automatically and pre-fills the patient form.</p>', unsafe_allow_html=True)
+
+    f1,f2,f3,f4 = st.columns(4)
+    for col, icon, fmt, desc in [
+        (f1,"📄","PDF","Lab reports, discharge summaries"),
+        (f2,"📝","DOCX","Clinical notes, referral letters"),
+        (f3,"📋","TXT","Plain text, HL7 exports"),
+        (f4,"🖼️","Image","Scanned documents (OCR)"),
+    ]:
+        col.markdown(f"""
+        <div class="tile">
+            <div style="font-size:1.6rem">{icon}</div>
+            <div style="font-weight:700;color:#111827;margin:.4rem 0 .2rem;font-size:.92rem">{fmt}</div>
+            <div style="font-size:.72rem;color:#6B7280">{desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    uploads = st.file_uploader(
+        "Drop files here or click to browse",
+        type=["pdf","docx","txt","md","png","jpg","jpeg","bmp","tiff","webp"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+    )
+
+    if uploads:
+        texts, log = [], []
+        for f in uploads:
+            with st.spinner(f"Reading {f.name}…"):
+                text, method = extract_file(f)
+            if text:
+                texts.append(f"=== {f.name} ===\n{text}")
+                log.append((f.name, method, len(text)))
+                st.markdown(f'<div class="banner-ok">✅ <b>{f.name}</b> extracted via {method} — {len(text):,} characters</div>', unsafe_allow_html=True)
+            else:
+                st.warning(f"⚠️ Could not read {f.name}: {method}")
+
+        if texts:
+            combined = "\n\n".join(texts)
+            st.session_state.update({
+                "doc_text": combined,
+                "doc_log":  log,
+                "doc_fields": smart_parse(combined),
+                "doc_ready": True,
+            })
+            with st.expander("📋 Preview extracted text"):
+                st.text_area("", value=combined[:4000]+("…" if len(combined)>4000 else ""),
+                             height=250, disabled=True, label_visibility="collapsed")
+            st.success(f"✅ {len(uploads)} file(s) processed. Go to **Patient Data** tab to review and run analysis.")
+
+    elif not st.session_state.get("doc_ready"):
+        st.markdown("""
+        <div class="upload-gate">
+            <div style="font-size:3rem;margin-bottom:1rem;">📂</div>
+            <div style="font-size:1.05rem;font-weight:700;color:#111827;margin-bottom:.5rem;">Drop a medical document here</div>
+            <div style="color:#6B7280;font-size:.85rem;margin-bottom:1rem;">
+                Or skip to <b>Patient Data</b> tab to enter information manually.
+            </div>
+            <div style="font-size:.78rem;color:#059669;">PDF · DOCX · TXT · PNG · JPG · BMP · TIFF</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        for fname, method, chars in st.session_state.get("doc_log",[]):
+            st.markdown(f'<div class="banner-ok">✅ <b>{fname}</b> — {method} · {chars:,} chars</div>', unsafe_allow_html=True)
+        if st.button("🗑 Clear documents"):
+            for k in ["doc_text","doc_log","doc_fields","doc_ready","last_result","last_elapsed","last_model","last_tps","last_patient"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 2 — PATIENT DATA
+# ─────────────────────────────────────────────────────────────────────────────
+with t2:
+    doc_ready  = st.session_state.get("doc_ready", False)
+    doc_fields = st.session_state.get("doc_fields", {})
+
+    if doc_ready:
+        st.markdown('<div class="banner-ok">📎 <b>Document loaded.</b> Fields below are pre-filled. Review and edit as needed.</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="banner-info">💡 <b>Tip:</b> Upload a document in the <b>📎 Upload Document</b> tab to auto-fill fields, or enter data manually below.</div>', unsafe_allow_html=True)
+
+    def fv(key):
+        if demo.get(key): return demo[key]
+        return doc_fields.get(key, "")
+
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        st.markdown("#### 👤 Demographics & History")
+        demographics    = st.text_input("Age / Sex / BMI / Lifestyle", value=fv("demographics"), placeholder="e.g. Male, 52yr, BMI 29, smoker")
+        chief_complaint = st.text_area("Chief Complaint", value=fv("chief_complaint"), placeholder="Primary complaint and duration…", height=88)
+        history         = st.text_area("Medical / Surgical / Family History", value=fv("history"), placeholder="PMH, PSH, FH, allergies…", height=96)
+        vitals          = st.text_area("Vitals", value=fv("vitals"), placeholder="BP, HR, RR, SpO2, Temp, Weight…", height=78)
+    with c2:
+        st.markdown("#### 🔬 Clinical Findings")
+        symptoms    = st.text_area("Symptoms & Review of Systems", value=fv("symptoms"), placeholder="Onset, duration, character, modifiers…", height=90)
+        labs        = st.text_area("Labs / Investigations / Imaging", value=fv("labs"), placeholder="CBC, BMP, ECG, MRI…", height=96)
+        medications = st.text_area("Current Medications", value=fv("medications"), placeholder="Drug, dose, frequency…", height=78)
+        notes       = st.text_area("Additional Notes", value=fv("notes"), placeholder="Allergies, procedures, observations…", height=66)
+
+    st.markdown("---")
+
+    has_data = any([demographics,chief_complaint,history,vitals,symptoms,labs,medications,notes])
+    gate_ok  = doc_ready or has_data
+
+    if not gate_ok:
+        st.markdown("""
+        <div style="background:#FEE2E2;border:1.5px solid #FCA5A5;border-radius:10px;
+             padding:.8rem 1.1rem;margin-bottom:1rem;">
+            🔒 <b style="color:#DC2626;">Analysis locked.</b>
+            <span style="color:#374151;"> Upload a document or fill at least one field to enable analysis.</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if model in avail:
+        st.markdown(f'<div style="font-size:.78rem;color:#6B7280;margin-bottom:.8rem;">🤖 Model: <b style="color:#059669;">{model}</b> &nbsp;·&nbsp; Timeout: {timeout}s &nbsp;·&nbsp; Local inference via Ollama</div>', unsafe_allow_html=True)
+
+    b1, b2, b3 = st.columns([2.5,1,1])
+    with b1:
+        run = st.button("🔍  Run Clinical Analysis", use_container_width=True, disabled=(not ok or not gate_ok))
+    with b2:
+        if st.button("🗑 Clear", use_container_width=True):
+            for k in ["last_result","last_elapsed","last_model","last_tps","last_patient"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+    with b3:
+        if st.button("📎 Upload docs", use_container_width=True):
+            st.info("Switch to the Upload Document tab above ↑")
+
+    if run:
+        if model not in avail:
+            st.error(f"Model not installed: `ollama pull {model}`")
+        else:
+            pd = dict(demographics=demographics, chief_complaint=chief_complaint,
+                      history=history, vitals=vitals, symptoms=symptoms,
+                      labs=labs, medications=medications, notes=notes)
+            if doc_ready:
+                dt = st.session_state.get("doc_text","")
+                if dt and dt not in pd["notes"]:
+                    pd["notes"] = (pd["notes"] + "\n\n--- DOC ---\n" + dt[:3000]).strip()
+            box = st.empty()
+            box.info(f"⏳ Running **{model}** locally… 30–120s on M-series Mac.")
+            with st.spinner("Analysing…"):
+                t0 = time.time()
+                result, tps = run_ollama(model, pd, timeout)
+                elapsed = round(time.time()-t0, 2)
+            box.empty()
+            if result:
+                st.session_state.setdefault("history_log",[]).append({
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                    "patient": demographics or "Unknown",
+                    "model": model, "result": result,
+                    "elapsed": elapsed, "tps": tps,
+                    "patient_data": pd,
+                })
+                st.session_state.update({
+                    "last_result": result, "last_elapsed": elapsed,
+                    "last_model": model, "last_tps": tps,
+                    "last_patient": pd,
+                })
+                st.success(f"✅ Done in {elapsed}s ({tps} tok/s) — switch to **📊 Analysis** tab.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 3 — RESULTS
+# ─────────────────────────────────────────────────────────────────────────────
+with t3:
+    if "last_result" not in st.session_state:
+        st.markdown("""
+        <div class="upload-gate">
+            <div style="font-size:3rem;margin-bottom:1rem;">📊</div>
+            <div style="font-size:1.05rem;font-weight:700;color:#111827;margin-bottom:.5rem;">No analysis yet</div>
+            <div style="color:#6B7280;font-size:.85rem;">Upload a document → fill Patient Data → click Run Analysis</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        R   = st.session_state["last_result"]
+        el  = st.session_state.get("last_elapsed","—")
+        mdl = st.session_state.get("last_model","local")
+        tps = st.session_state.get("last_tps",0)
+        pd_ = st.session_state.get("last_patient",{})
+
+        rl  = R.get("risk_level","UNKNOWN")
+        rs  = int(R.get("risk_score",0))
+        rco = rl_color(rl)
+
+        # ── Stat tiles ──
+        sc1,sc2,sc3,sc4 = st.columns(4)
+        for col, val, lbl, color in [
+            (sc1, rl,       "Risk Level",     rco),
+            (sc2, f"{rs}/100","Risk Score",   "#059669"),
+            (sc3, f"{el}s", "Inference Time", "#2563EB"),
+            (sc4, f"{tps}", "Tokens/sec",     "#6B7280"),
+        ]:
+            col.markdown(f"""
+            <div class="tile">
+                <div class="tile-val" style="color:{color}">{val}</div>
+                <div class="tile-lbl">{lbl}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Summary + Flags + Follow-up ──
+        r1,r2,r3 = st.columns([3,1.1,1.1])
+        with r1:
+            ci = R.get("clinical_impression","")
+            st.markdown(f"""
+            <div class="card card-green">
+                <div class="sec-label">Clinical Summary · {mdl}</div>
+                <p style="color:#111827;font-size:.93rem;line-height:1.7;margin:.5rem 0;">
+                    {R.get("summary","—")}
+                </p>
+                {f'<p style="color:#059669;font-size:.85rem;font-style:italic;margin:0 0 .8rem;">💡 {ci}</p>' if ci else ""}
+                <div style="margin-bottom:6px;">Overall Risk &nbsp; {rl_badge(rl)}</div>
+                <div class="rbar-bg">
+                    <div class="rbar-fill" style="width:{rs}%;background:{rco};"></div>
+                </div>
+                <div style="font-size:.7rem;color:#6B7280;">Risk Index: {rs}/100</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with r2:
+            flags = R.get("urgent_flags",[])
+            fhtml = "".join(f'<div style="font-size:.82rem;color:#DC2626;margin-bottom:6px;font-weight:500;">⚠ {f}</div>' for f in flags) \
+                    or '<div style="color:#6B7280;font-size:.82rem;">No urgent flags</div>'
+            st.markdown(f"""
+            <div class="card card-red" style="height:100%">
+                <div class="sec-label" style="color:#DC2626;">Urgent Flags</div>
+                {fhtml}
+            </div>
+            """, unsafe_allow_html=True)
+        with r3:
+            fu   = R.get("follow_up",{})
+            mons = fu.get("monitoring",[])[:5]
+            reds = fu.get("red_flags",[])[:3]
+            mh   = "".join(f'<div style="font-size:.8rem;color:#374151;margin-bottom:4px;">• {m}</div>' for m in mons)
+            rh   = "".join(f'<div style="font-size:.76rem;color:#D97706;margin-bottom:3px;">⚠ {r}</div>' for r in reds)
+            st.markdown(f"""
+            <div class="card card-green" style="height:100%">
+                <div class="sec-label">Follow-up</div>
+                <div style="font-size:.88rem;font-weight:700;color:#059669;margin-bottom:8px;">{fu.get("timeframe","—")}</div>
+                {mh}
+                {('<div style="margin-top:6px;font-size:.7rem;color:#6B7280;margin-bottom:3px;">RED FLAGS</div>'+rh) if reds else ''}
+            </div>
+            """, unsafe_allow_html=True)
+
+        # ── PDF Download (top) ──
+        if HAS_RL:
+            pdf_bytes = generate_pdf_report(R, pd_, {
+                "timestamp": datetime.now().strftime("%d %b %Y, %H:%M"),
+                "model": mdl, "elapsed": el,
+            })
+            st.download_button(
+                "⬇️  Download PDF Report",
+                data=pdf_bytes,
+                file_name=f"MedInsight_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                mime="application/pdf",
+                use_container_width=False,
+            )
+        else:
+            st.warning("Install reportlab for PDF export: `pip install reportlab`")
+
+        st.markdown("---")
+
+        # ── Detail tabs ──
+        rt1,rt2,rt3,rt4,rt5 = st.tabs(["🧬 Differentials","🔬 Labs","📊 Risk","💊 Drugs","📋 Recs"])
+
+        with rt1:
+            if active.get("🧬 Differentials"):
+                diffs = R.get("differentials",[])
+                if diffs:
+                    for i, d in enumerate(diffs):
+                        conf = int(d.get("confidence_percent",0))
+                        cc   = "#DC2626" if conf>70 else "#D97706" if conf>40 else "#059669"
+                        kf   = d.get("key_features",[])
+                        ag   = d.get("against","")
+                        kfh  = "".join(f'<span class="badge b-gray">{k}</span>' for k in kf[:4])
+                        st.markdown(f"""
+                        <div class="card" style="margin-bottom:.7rem">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                                <b style="font-size:.95rem;color:#111827">{i+1}. {d.get("condition","")}</b>
+                                <div>{prob_badge(d.get("probability",""))} <span class="badge b-gray">{d.get("icd10","")}</span></div>
+                            </div>
+                            <div style="font-size:.72rem;color:#6B7280;margin-bottom:4px">
+                                CONFIDENCE &nbsp;<b style="color:{cc}">{conf}%</b>
+                            </div>
+                            <div class="cbar-bg"><div class="cbar-fill" style="width:{conf}%;background:{cc}"></div></div>
+                            <p style="color:#374151;font-size:.85rem;line-height:1.65;margin-bottom:8px">{d.get("reasoning","")}</p>
+                            {f'<div style="margin-bottom:6px">{kfh}</div>' if kf else ""}
+                            {f'<div style="font-size:.78rem;color:#6B7280"><b style="color:#D97706">Against:</b> {ag}</div>' if ag else ""}
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.info("No differentials returned — try a larger model.")
+            else:
+                st.info("Module disabled.")
+
+        with rt2:
+            if active.get("🔬 Labs"):
+                labs_list = R.get("lab_analysis",[])
+                if labs_list:
+                    act = [l for l in labs_list if l.get("action_needed")]
+                    nrm = [l for l in labs_list if not l.get("action_needed")]
+                    for grp, title in [(act,"⚡ Requires Action"),(nrm,"✓ Within Reference")]:
+                        if grp:
+                            st.markdown(f"##### {title}")
+                            for lab in grp:
+                                s   = lab.get("status","NORMAL")
+                                cls = {"CRITICAL":"card-red","HIGH":"card-orange","LOW":"card-blue","NORMAL":"card-green"}.get(s,"")
+                                st.markdown(f"""
+                                <div class="card {cls}" style="margin-bottom:.5rem">
+                                    <div style="display:flex;justify-content:space-between;align-items:baseline">
+                                        <b style="color:#111827">{lab.get("parameter","")}</b>
+                                        <span>
+                                            {status_badge(s)}
+                                            <span style="font-family:'JetBrains Mono',monospace;font-size:.9rem;color:#111827;font-weight:700"> {lab.get("value","")}</span>
+                                            <span style="color:#6B7280;font-size:.75rem"> (Ref: {lab.get("reference","")})</span>
+                                        </span>
+                                    </div>
+                                    <p style="font-size:.83rem;color:#374151;margin:.5rem 0 0">{lab.get("interpretation","")}</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                else:
+                    st.info("No lab values returned.")
+            else:
+                st.info("Module disabled.")
+
+        with rt3:
+            if active.get("📊 Risk"):
+                risks = R.get("risk_predictions",[])
+                if risks:
+                    mod = [r for r in risks if r.get("modifiable",True)]
+                    fix = [r for r in risks if not r.get("modifiable",True)]
+                    for grp, title in [(mod,"🎯 Modifiable"),(fix,"📌 Non-Modifiable")]:
+                        if grp:
+                            st.markdown(f"##### {title}")
+                            for rp in grp:
+                                pct = min(100,max(0,int(rp.get("risk_percent",0))))
+                                bc  = "#DC2626" if pct>65 else "#D97706" if pct>35 else "#059669"
+                                st.markdown(f"""
+                                <div class="card" style="margin-bottom:.65rem">
+                                    <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px">
+                                        <b style="color:#111827">{rp.get("condition","")}</b>
+                                        <span style="font-size:1.2rem;font-weight:800;color:{bc}">{pct}%</span>
+                                    </div>
+                                    <div class="rbar-bg">
+                                        <div class="rbar-fill" style="width:{pct}%;background:{bc}"></div>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;font-size:.75rem;color:#6B7280">
+                                        <span>⏱ {rp.get("timeframe","")}</span>
+                                        <span>📚 {rp.get("basis","")}</span>
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+                else:
+                    st.info("No risk predictions returned.")
+            else:
+                st.info("Module disabled.")
+
+        with rt4:
+            if active.get("💊 Drugs"):
+                ixns = R.get("drug_interactions",[])
+                if ixns:
+                    for ix in ixns:
+                        sv  = ix.get("severity","")
+                        cls = {"Major":"card-red","Moderate":"card-orange","Minor":"card-blue"}.get(sv,"")
+                        drugs = " + ".join(ix.get("drugs",[]))
+                        st.markdown(f"""
+                        <div class="card {cls}" style="margin-bottom:.7rem">
+                            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+                                <b style="font-family:'JetBrains Mono',monospace;font-size:.88rem;color:#111827">{drugs}</b>
+                                {sev_badge(sv)}
+                            </div>
+                            {f'<p style="font-size:.78rem;color:#6B7280;margin:.3rem 0"><b style="color:#374151">Mechanism:</b> {ix.get("mechanism","")}</p>' if ix.get("mechanism") else ""}
+                            <p style="font-size:.84rem;color:#374151;margin:.3rem 0"><b>Effect:</b> {ix.get("effect","")}</p>
+                            <p style="font-size:.82rem;color:#374151;margin:.3rem 0"><b>Action:</b> {ix.get("action","")}</p>
+                            {f'<p style="font-size:.77rem;color:#6B7280;margin:.3rem 0"><b>Monitor:</b> {ix.get("monitoring","")}</p>' if ix.get("monitoring") else ""}
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.markdown('<div class="card card-green"><span style="color:#059669;font-weight:700">✓</span> No significant drug interactions identified.</div>', unsafe_allow_html=True)
+            else:
+                st.info("Module disabled.")
+
+        with rt5:
+            if active.get("📋 Recs"):
+                recs = R.get("recommendations",[])
+                if recs:
+                    by_cat = {}
+                    for rec in recs:
+                        by_cat.setdefault(rec.get("category","Other"),[]).append(rec)
+                    icons = {"Investigation":"🔬","Medication":"💊","Referral":"🏥","Monitoring":"📈","Lifestyle":"🌿","Other":"📋"}
+                    for cat in ["Investigation","Medication","Referral","Monitoring","Lifestyle","Other"]:
+                        items = by_cat.get(cat,[])
+                        if not items: continue
+                        st.markdown(f"##### {icons.get(cat,'📋')} {cat}")
+                        for rec in items:
+                            eg = rec.get("evidence_grade","")
+                            st.markdown(f"""
+                            <div class="card" style="margin-bottom:.5rem">
+                                <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px">
+                                    <span style="font-size:.9rem;font-weight:600;color:#111827">{rec.get("action","")}</span>
+                                    <div>{prio_badge(rec.get("priority",""))} {grade_badge(eg) if eg else ""}</div>
+                                </div>
+                                <div style="font-size:.77rem;color:#6B7280">📚 {rec.get("evidence","")}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                else:
+                    st.info("No recommendations returned.")
+            else:
+                st.info("Module disabled.")
+
+        # ── Export row ──
+        st.markdown("---")
+        e1, e2 = st.columns(2)
+        with e1:
+            with st.expander("🔧 Raw JSON"):
+                st.code(json.dumps(R, indent=2), language="json")
+        with e2:
+            st.download_button(
+                "⬇️ Export JSON",
+                data=json.dumps({"generated":datetime.now().isoformat(),"model":mdl,"elapsed":el,"analysis":R}, indent=2),
+                file_name=f"MedInsight_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+        st.markdown(f"""
+        <div class="footer">
+            MedInsight AI v4 &nbsp;·&nbsp; {mdl} &nbsp;·&nbsp; {el}s · {tps} tok/s &nbsp;·&nbsp;
+            {datetime.now().strftime("%d %b %Y, %H:%M")} &nbsp;·&nbsp;
+            Clinical decision support only — not a substitute for clinical evaluation.
+        </div>
+        """, unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 4 — HISTORY
+# ─────────────────────────────────────────────────────────────────────────────
+with t4:
+    log = st.session_state.get("history_log",[])
+    if not log:
+        st.markdown("""
+        <div class="upload-gate">
+            <div style="font-size:2.5rem;margin-bottom:.8rem">📂</div>
+            <div style="font-size:1rem;font-weight:700;color:#111827;margin-bottom:.4rem">No session history yet</div>
+            <div style="color:#6B7280;font-size:.85rem">Completed analyses appear here for review and comparison.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"### {len(log)} Analysis Session{'s' if len(log)>1 else ''}")
+        for i, h in enumerate(reversed(log)):
+            rl  = h["result"].get("risk_level","")
+            rs  = h["result"].get("risk_score","—")
+            with st.expander(f"[{h['ts']}]  {h['patient'][:45]}…  ·  {rl}  ·  {h.get('model','')}", expanded=(i==0)):
+                ca, cb = st.columns([3,1])
+                with ca:
+                    st.markdown(f"**Summary:** {h['result'].get('summary','')}")
+                with cb:
+                    st.markdown(f"{rl_badge(rl)}<br><span style='color:#6B7280;font-size:.78rem'>{h['elapsed']}s · {h.get('tps',0)} tok/s</span>", unsafe_allow_html=True)
+                co1, co2, co3 = st.columns(3)
+                with co1:
+                    if st.button("↩ Reload", key=f"rl_{i}"):
+                        st.session_state.update({"last_result":h["result"],"last_elapsed":h["elapsed"],"last_model":h.get("model",""),"last_tps":h.get("tps",0),"last_patient":h.get("patient_data",{})})
+                        st.rerun()
+                with co2:
+                    if HAS_RL:
+                        pdf = generate_pdf_report(h["result"], h.get("patient_data",{}), {"timestamp":h["ts"],"model":h.get("model",""),"elapsed":h["elapsed"]})
+                        st.download_button("⬇️ PDF", data=pdf, file_name=f"MedInsight_{h['ts'].replace(':','')}.pdf", mime="application/pdf", key=f"pdf_{i}")
+                with co3:
+                    st.download_button("⬇️ JSON", data=json.dumps(h["result"],indent=2), file_name=f"MedInsight_{h['ts'].replace(':','')}.json", mime="application/json", key=f"js_{i}")
