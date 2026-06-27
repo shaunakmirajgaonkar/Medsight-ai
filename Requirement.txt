@@ -1,0 +1,17 @@
+# MedInsight AI — Python Dependencies
+# Install: pip install -r requirements.txt
+# Optional OCR: brew install tesseract (macOS) | sudo apt install tesseract-ocr (Linux)
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+streamlit>=1.35.0           # Web UI framework
+requests>=2.31.0            # Ollama HTTP client
+
+# ── Document extraction ───────────────────────────────────────────────────────
+pymupdf>=1.24.0             # PDF text extraction  (import as fitz)
+python-docx>=1.1.0          # DOCX / Word document parsing
+Pillow>=10.0.0              # Image handling (for OCR pre-processing)
+pytesseract>=0.3.10         # OCR wrapper for Tesseract engine
+                            # Also requires: brew install tesseract
+
+# ── PDF report generation ─────────────────────────────────────────────────────
+reportlab>=4.0.0            # Professional PDF report builder
